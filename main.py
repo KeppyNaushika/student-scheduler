@@ -12,21 +12,22 @@ import time
 # PuLP for Integer Linear Programming
 from pulp import (
     LpProblem, LpMinimize, LpVariable, LpBinary, lpSum, LpStatus, value,
-    PULP_CBC_CMD
+    COIN_CMD
 )
 
-def get_cbc_path():
-    """PyInstallerバンドル時のCBCソルバーパスを取得"""
+def get_solver():
+    """ソルバーを取得（PyInstallerバンドル時はパスを指定）"""
     if getattr(sys, 'frozen', False):
         # PyInstallerでバンドルされた場合
-        base_path = sys._MEIPASS
+        base_path = sys._MEIPASS  # type: ignore[attr-defined]
         if platform.system() == 'Windows':
-            return os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'win', '64', 'cbc.exe')
+            cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'win', '64', 'cbc.exe')
         elif platform.system() == 'Darwin':
-            return os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'osx', '64', 'cbc')
+            cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'osx', '64', 'cbc')
         else:
-            return os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'linux', 'i64', 'cbc')
-    return None
+            cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'linux', 'i64', 'cbc')
+        return COIN_CMD(path=cbc_path, msg=0)
+    return COIN_CMD(msg=0)
 
 
 class StudentScheduler:
@@ -349,12 +350,7 @@ class StudentScheduler:
 
         # 求解
         start_time = time.time()
-        cbc_path = get_cbc_path()
-        if cbc_path:
-            solver = PULP_CBC_CMD(path=cbc_path, msg=0)
-        else:
-            solver = PULP_CBC_CMD(msg=0)
-        prob.solve(solver)
+        prob.solve(get_solver())
         solve_time = time.time() - start_time
 
         print(f"\n✓ 求解完了（{solve_time:.1f}秒）")
@@ -425,12 +421,7 @@ class StudentScheduler:
                 prob += count >= relaxed_min
                 prob += count <= relaxed_max
 
-        cbc_path = get_cbc_path()
-        if cbc_path:
-            solver = PULP_CBC_CMD(path=cbc_path, msg=0)
-        else:
-            solver = PULP_CBC_CMD(msg=0)
-        prob.solve(solver)
+        prob.solve(get_solver())
 
         if prob.status != 1:
             raise ValueError("最適化に失敗しました。入力データを確認してください。")
