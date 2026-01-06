@@ -10,15 +10,13 @@ import platform
 import time
 
 # PuLP for Integer Linear Programming
-from pulp import (
-    LpProblem, LpMinimize, LpVariable, LpBinary, lpSum, LpStatus, value,
-    COIN_CMD
-)
+from pulp import LpProblem, LpMinimize, LpVariable, LpBinary, lpSum, LpStatus, value
 
 def get_solver():
     """ソルバーを取得（PyInstallerバンドル時はパスを指定）"""
     if getattr(sys, 'frozen', False):
         # PyInstallerでバンドルされた場合
+        from pulp import COIN_CMD
         base_path = sys._MEIPASS  # type: ignore[attr-defined]
         if platform.system() == 'Windows':
             cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'win', '64', 'cbc.exe')
@@ -27,7 +25,8 @@ def get_solver():
         else:
             cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'linux', 'i64', 'cbc')
         return COIN_CMD(path=cbc_path, msg=0)
-    return COIN_CMD(msg=0)
+    # 通常実行時はデフォルトソルバー
+    return None
 
 
 class StudentScheduler:
@@ -350,7 +349,11 @@ class StudentScheduler:
 
         # 求解
         start_time = time.time()
-        prob.solve(get_solver())
+        solver = get_solver()
+        if solver:
+            prob.solve(solver)
+        else:
+            prob.solve()
         solve_time = time.time() - start_time
 
         print(f"\n✓ 求解完了（{solve_time:.1f}秒）")
@@ -421,7 +424,11 @@ class StudentScheduler:
                 prob += count >= relaxed_min
                 prob += count <= relaxed_max
 
-        prob.solve(get_solver())
+        solver = get_solver()
+        if solver:
+            prob.solve(solver)
+        else:
+            prob.solve()
 
         if prob.status != 1:
             raise ValueError("最適化に失敗しました。入力データを確認してください。")
