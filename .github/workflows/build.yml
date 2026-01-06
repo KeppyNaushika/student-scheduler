@@ -25,7 +25,10 @@ jobs:
         run: uv sync --group dev
 
       - name: Build EXE with PyInstaller
-        run: uv run pyinstaller --onefile --name student-scheduler main.py
+        shell: pwsh
+        run: |
+          $pulpPath = uv run python -c "import pulp; import os; print(os.path.dirname(pulp.__file__))"
+          uv run pyinstaller --onefile --name student-scheduler --add-data "$pulpPath\solverdir;pulp\solverdir" --hidden-import=pulp main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
