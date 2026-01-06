@@ -132,20 +132,43 @@ class StudentScheduler:
     
     def wait_for_file_close(self, filename):
         """ファイルが閉じられるまで待機"""
-        print(f"\n📝 {filename} を開きました")
-        print("データを入力して保存し、ファイルを閉じてください...")
+        print(f"\n📝 {filename} を開いています...")
+        print("データを入力して保存し、ファイルを閉じてください。")
         print("（ファイルを閉じると自動的に処理が続行されます）")
-        
+
+        # Excelがファイルを開くまで待機（最大30秒）
+        print("\nExcelがファイルを開くのを待っています...", end="", flush=True)
+        file_opened = False
+        for _ in range(30):
+            try:
+                with open(filename, 'r+b'):
+                    pass
+                # ファイルが開けた = まだExcelが開いていない
+                print(".", end="", flush=True)
+                time.sleep(1)
+            except (PermissionError, IOError):
+                # ファイルがロックされた = Excelが開いた
+                file_opened = True
+                print("\n✓ Excelがファイルを開きました。編集してください。")
+                break
+
+        if not file_opened:
+            # 30秒待ってもロックされなかった場合、ユーザーに確認
+            print("\n")
+            input("Excelでファイルを開いて編集し、保存して閉じたら Enter キーを押してください...")
+            return
+
+        # ファイルが閉じられるまで待機
+        print("ファイルが閉じられるのを待っています...", end="", flush=True)
         while True:
             try:
-                # ファイルを書き込みモードで開けるか試す（閉じられているか確認）
                 with open(filename, 'r+b'):
                     pass
                 print("\n✓ ファイルが閉じられました。処理を続行します...")
-                time.sleep(1)  # 少し待機してからファイルを読む
+                time.sleep(1)
                 break
             except (PermissionError, IOError):
-                # ファイルが開かれている
+                print(".", end="", flush=True)
                 time.sleep(2)
     
     def load_data(self):
