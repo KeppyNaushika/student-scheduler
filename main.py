@@ -13,19 +13,35 @@ import time
 from pulp import LpProblem, LpMinimize, LpVariable, LpBinary, lpSum, LpStatus, value
 
 def get_solver():
-    """ソルバーを取得（PyInstallerバンドル時はパスを指定）"""
+    """利用可能なソルバーを取得"""
+    import pulp
+
+    # 利用可能なソルバーを確認
+    available = pulp.listSolvers(onlyAvailable=True)
+
+    # HiGHSを優先（クロスプラットフォームで安定）
+    if 'HiGHS' in available:
+        return pulp.HiGHS(msg=False)
+
+    # PyInstallerバンドル時はCOIN_CMDでパス指定
     if getattr(sys, 'frozen', False):
-        # PyInstallerでバンドルされた場合
-        from pulp import COIN_CMD
-        base_path = sys._MEIPASS  # type: ignore[attr-defined]
-        if platform.system() == 'Windows':
-            cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'win', '64', 'cbc.exe')
-        elif platform.system() == 'Darwin':
-            cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'osx', '64', 'cbc')
-        else:
-            cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'linux', 'i64', 'cbc')
-        return COIN_CMD(path=cbc_path, msg=0)
-    # 通常実行時はデフォルトソルバー
+        try:
+            base_path = sys._MEIPASS  # type: ignore[attr-defined]
+            if platform.system() == 'Windows':
+                cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'win', '64', 'cbc.exe')
+            elif platform.system() == 'Darwin':
+                cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'osx', '64', 'cbc')
+            else:
+                cbc_path = os.path.join(base_path, 'pulp', 'solverdir', 'cbc', 'linux', 'i64', 'cbc')
+            return pulp.COIN_CMD(path=cbc_path, msg=0)
+        except Exception:
+            pass
+
+    # PULP_CBC_CMDがあればそれを使用
+    if 'PULP_CBC_CMD' in available:
+        return pulp.PULP_CBC_CMD(msg=0)
+
+    # デフォルト（PuLPが自動選択）
     return None
 
 
