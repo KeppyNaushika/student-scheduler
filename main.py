@@ -246,17 +246,41 @@ class StudentScheduler:
             return student['preferences'].index(course) + 1
         return 999
 
+    def calculate_student_score(self, assignment, student):
+        """個々の生徒のスコアを計算（希望順位の合計、小さいほど良い）"""
+        total = 0
+        student_assignment = assignment.get(student['id'], {})
+        for period, course in student_assignment.items():
+            rank = self.get_preference_rank(student, course)
+            total += rank
+        return total
+
     def calculate_assignment_score(self, assignment):
         """
         配置のスコアを計算（小さいほど良い）
         - 希望順位の合計
+        - 公平性ペナルティ（生徒間の偏りを抑制）
         """
-        total = 0
+        student_scores = []
         for student in self.students:
-            student_assignment = assignment.get(student['id'], {})
-            for period, course in student_assignment.items():
-                rank = self.get_preference_rank(student, course)
-                total += rank
+            score = self.calculate_student_score(assignment, student)
+            student_scores.append(score)
+
+        total = sum(student_scores)
+
+        # 公平性ペナルティ: 最も不幸な生徒と最も幸福な生徒の差
+        if student_scores:
+            max_score = max(student_scores)
+            min_score = min(student_scores)
+            fairness_penalty = (max_score - min_score) * 5  # 偏りに対するペナルティ
+
+            # 分散ペナルティ: スコアのばらつきを抑制
+            avg_score = total / len(student_scores)
+            variance = sum((s - avg_score) ** 2 for s in student_scores) / len(student_scores)
+            variance_penalty = variance * 2
+
+            total += fairness_penalty + variance_penalty
+
         return total
 
     def count_course_students(self, assignment, period, course):
@@ -512,6 +536,120 @@ class StudentScheduler:
                 col_offset += 3  # 次の講座へ（1列空ける）
 
             col_offset += 1  # 次の時限へ（さらに1列空ける）
+
+        # ========== シート3: 希望達成度 ==========
+        ws_stats = wb.create_sheet("希望達成度")
+
+        # ヘッダー
+        stat_headers = ['生徒番号', '氏名', '満足度スコア', '平均希望順位'] + \
+                       [f'第{i}希望' for i in range(1, self.num_choices + 1)] + ['希望外']
+        for col, header in enumerate(stat_headers, 1):
+            cell = ws_stats.cell(1, col, header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = border
+            cell.alignment = center_align
+
+        # 各生徒の統計を計算
+        student_stats = []
+        for student in sorted_students:
+            rank_counts = defaultdict(int)
+            total_rank = 0
+            count = 0
+
+            for period, course in assignment[student['id']].items():
+                rank = self.get_preference_rank(student, course)
+                if rank < 999:
+                    rank_counts[rank] += 1
+                    total_rank += rank
+                else:
+                    rank_counts['希望外'] += 1
+                    total_rank += self.num_choices + 1  # 希望外は最低順位+1として計算
+                count += 1
+
+            avg_rank = total_rank / count if count > 0 else 0
+            # 満足度スコア: 100点満点（第1希望ばかりなら100点）
+            max_possible = self.num_periods  # 全部第1希望の場合
+            min_possible = self.num_periods * (self.num_choices + 1)  # 全部希望外の場合
+            satisfaction = 100 * (min_possible - total_rank) / (min_possible - max_possible) if min_possible > max_possible else 100
+
+            student_stats.append({
+                'student': student,
+                'satisfaction': satisfaction,
+                'avg_rank': avg_rank,
+                'rank_counts': rank_counts
+            })
+
+        # 満足度でソート（低い順＝不幸な生徒を上に）して表示
+        student_stats.sort(key=lambda x: x['satisfaction'])
+
+        for row_idx, stat in enumerate(student_stats, 2):
+            student = stat['student']
+
+            # 生徒番号
+            cell = ws_stats.cell(row_idx, 1, student['id'])
+            cell.border = border
+            cell.alignment = center_align
+
+            # 氏名
+            cell = ws_stats.cell(row_idx, 2, student['name'])
+            cell.border = border
+            cell.alignment = left_align
+
+            # 満足度スコア
+            cell = ws_stats.cell(row_idx, 3, round(stat['satisfaction'], 1))
+            cell.border = border
+            cell.alignment = center_align
+            # 満足度に応じて色分け
+            if stat['satisfaction'] >= 80:
+                cell.fill = good_fill
+            elif stat['satisfaction'] >= 60:
+                cell.fill = warning_fill
+            else:
+                cell.fill = bad_fill
+
+            # 平均希望順位
+            cell = ws_stats.cell(row_idx, 4, round(stat['avg_rank'], 2))
+            cell.border = border
+            cell.alignment = center_align
+
+            # 各希望順位の件数
+            for rank in range(1, self.num_choices + 1):
+                cell = ws_stats.cell(row_idx, 4 + rank, stat['rank_counts'].get(rank, 0))
+                cell.border = border
+                cell.alignment = center_align
+
+            # 希望外
+            cell = ws_stats.cell(row_idx, 5 + self.num_choices, stat['rank_counts'].get('希望外', 0))
+            cell.border = border
+            cell.alignment = center_align
+
+        # 統計サマリー行
+        summary_row = len(student_stats) + 3
+        ws_stats.cell(summary_row, 1, '【統計】').font = Font(bold=True)
+
+        satisfactions = [s['satisfaction'] for s in student_stats]
+        avg_ranks = [s['avg_rank'] for s in student_stats]
+
+        stats_info = [
+            (summary_row + 1, '平均満足度', f"{sum(satisfactions)/len(satisfactions):.1f}点"),
+            (summary_row + 2, '最低満足度', f"{min(satisfactions):.1f}点"),
+            (summary_row + 3, '最高満足度', f"{max(satisfactions):.1f}点"),
+            (summary_row + 4, '満足度の標準偏差', f"{(sum((s-sum(satisfactions)/len(satisfactions))**2 for s in satisfactions)/len(satisfactions))**0.5:.2f}"),
+            (summary_row + 5, '平均希望順位', f"{sum(avg_ranks)/len(avg_ranks):.2f}"),
+        ]
+
+        for row, label, value in stats_info:
+            ws_stats.cell(row, 1, label).font = Font(bold=True)
+            ws_stats.cell(row, 2, value)
+
+        # 列幅調整
+        ws_stats.column_dimensions['A'].width = 12
+        ws_stats.column_dimensions['B'].width = 15
+        ws_stats.column_dimensions['C'].width = 14
+        ws_stats.column_dimensions['D'].width = 14
+        for col in range(5, 6 + self.num_choices):
+            ws_stats.column_dimensions[get_column_letter(col)].width = 10
 
         wb.save(self.output_file)
         print(f"\n✓ 結果を保存しました: {self.output_file}")
