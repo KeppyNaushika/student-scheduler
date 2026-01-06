@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "openpyxl>=3.1.0",
+    "pulp>=2.7.0",
 ]
 
 [project.scripts]

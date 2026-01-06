@@ -2,13 +2,16 @@
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import random
 from collections import defaultdict
-import copy
 import os
 import subprocess
 import platform
 import time
+
+# PuLP for Integer Linear Programming
+from pulp import (
+    LpProblem, LpMinimize, LpVariable, LpBinary, lpSum, LpStatus, value
+)
 
 
 class StudentScheduler:
@@ -84,9 +87,6 @@ class StudentScheduler:
         ws_info = wb.create_sheet("使い方", 0)
         ws_info.column_dimensions['A'].width = 80
 
-        # 各時限の目標人数
-        target_per_period_course = self.num_students * self.num_periods // (self.num_choices * self.num_periods)
-
         info_texts = [
             "【学生講座配置プログラム - 使い方】",
             "",
@@ -112,7 +112,7 @@ class StudentScheduler:
             f"・各時限で全{self.num_choices}講座が開講されます",
             f"・各生徒は{self.num_choices}講座のうち{self.num_periods}講座を受講します",
             "・生徒によって受講する講座の組み合わせは異なります",
-            "・できるだけ希望順位の高い講座が選ばれます",
+            "・整数線形計画法(ILP)により最適解を計算します",
             "・各講座の人数ができるだけ均等になるよう調整されます",
         ]
 
@@ -235,247 +235,196 @@ class StudentScheduler:
         """生徒の希望順位を取得（1始まり、希望外は大きな値）"""
         if course in student['preferences']:
             return student['preferences'].index(course) + 1
-        return 999
+        return self.num_choices + 1  # 希望外
 
-    def calculate_student_score(self, selected_courses, student):
-        """生徒が選択した講座の希望順位合計を計算"""
-        total = 0
-        for course in selected_courses:
-            rank = self.get_preference_rank(student, course)
-            total += rank
-        return total
-
-    def calculate_fairness_score(self, course_selection, schedule):
+    def solve_with_ilp(self):
         """
-        配置のスコアを計算（小さいほど良い）
-        - 希望順位の合計
-        - 公平性ペナルティ
-        - 人数バランスペナルティ
+        整数線形計画法(ILP)で最適配置を求める
+
+        決定変数:
+            x[s,c,p] = 1 if student s takes course c in period p
+
+        目的関数:
+            minimize Σ (preference_rank[s,c] * x[s,c,p]) + fairness_penalty
+
+        制約:
+            1. 各生徒は各時限で1つの講座を受講
+            2. 各生徒は各講座を最大1回受講
+            3. 各生徒はnum_periods個の講座を受講
+            4. 各時限の各講座の人数は目標±許容範囲
         """
-        # 各生徒の満足度スコア
-        student_scores = []
-        for student in self.students:
-            selected = course_selection.get(student['id'], set())
-            score = self.calculate_student_score(selected, student)
-            student_scores.append(score)
+        print("\n【整数線形計画法(ILP)で最適化】")
+        print("問題を定式化中...")
 
-        total = sum(student_scores)
+        # 問題の作成
+        prob = LpProblem("StudentScheduler", LpMinimize)
 
-        # 公平性ペナルティ
-        if student_scores:
-            max_score = max(student_scores)
-            min_score = min(student_scores)
-            fairness_penalty = (max_score - min_score) * 10
+        # インデックス
+        students_idx = range(len(self.students))
+        courses_idx = range(len(self.courses))
+        periods_idx = range(1, self.num_periods + 1)
 
-            avg_score = total / len(student_scores)
-            variance = sum((s - avg_score) ** 2 for s in student_scores) / len(student_scores)
-            variance_penalty = variance * 3
+        # 決定変数: x[s][c][p] = 1 if student s takes course c in period p
+        x = {}
+        for s in students_idx:
+            for c in courses_idx:
+                for p in periods_idx:
+                    x[s, c, p] = LpVariable(f"x_{s}_{c}_{p}", cat=LpBinary)
 
-            total += fairness_penalty + variance_penalty
+        # 補助変数: y[s][c] = 1 if student s takes course c (any period)
+        y = {}
+        for s in students_idx:
+            for c in courses_idx:
+                y[s, c] = LpVariable(f"y_{s}_{c}", cat=LpBinary)
 
-        # 人数バランスペナルティ
-        if schedule:
-            target = len(self.students) / len(self.courses)
-            for period in range(1, self.num_periods + 1):
-                for course in self.courses:
-                    count = sum(1 for s in self.students
-                                if schedule.get(s['id'], {}).get(period) == course)
-                    if abs(count - target) > self.tolerance:
-                        total += (abs(count - target) - self.tolerance) ** 2 * 50
+        # 公平性のための補助変数
+        max_score = LpVariable("max_score", lowBound=0)
+        min_score = LpVariable("min_score", lowBound=0)
 
-        return total
+        # 各生徒のスコア（希望順位の合計）
+        student_scores = {}
+        for s in students_idx:
+            student = self.students[s]
+            student_scores[s] = lpSum(
+                self.get_preference_rank(student, self.courses[c]) * y[s, c]
+                for c in courses_idx
+            )
 
-    def greedy_assign(self):
-        """
-        貪欲法による初期配置
-        1. 各生徒に受講する講座を決定
-        2. 時間割を作成
-        """
-        # ========== フェーズ1: 講座選択 ==========
-        # course_selection[student_id] = set of courses
+        print("目的関数を設定中...")
+
+        # 目的関数: 希望順位の合計 + 公平性ペナルティ
+        total_preference_score = lpSum(student_scores[s] for s in students_idx)
+        fairness_penalty = (max_score - min_score) * 10
+
+        prob += total_preference_score + fairness_penalty, "Total_Cost"
+
+        print("制約条件を追加中...")
+
+        # 制約1: 各生徒は各時限で1つの講座を受講
+        for s in students_idx:
+            for p in periods_idx:
+                prob += lpSum(x[s, c, p] for c in courses_idx) == 1, f"OnePerPeriod_s{s}_p{p}"
+
+        # 制約2: 各生徒は各講座を最大1回受講
+        for s in students_idx:
+            for c in courses_idx:
+                prob += lpSum(x[s, c, p] for p in periods_idx) <= 1, f"MaxOnce_s{s}_c{c}"
+
+        # 制約3: y[s,c]とx[s,c,p]の関係
+        for s in students_idx:
+            for c in courses_idx:
+                prob += y[s, c] == lpSum(x[s, c, p] for p in periods_idx), f"Link_y_x_s{s}_c{c}"
+
+        # 制約4: 各時限の各講座の人数バランス
+        target_per_course = len(self.students) / len(self.courses)
+        min_per_course = max(0, int(target_per_course - self.tolerance))
+        max_per_course = int(target_per_course + self.tolerance) + 1
+
+        for p in periods_idx:
+            for c in courses_idx:
+                count = lpSum(x[s, c, p] for s in students_idx)
+                prob += count >= min_per_course, f"MinBalance_p{p}_c{c}"
+                prob += count <= max_per_course, f"MaxBalance_p{p}_c{c}"
+
+        # 制約5: 公平性（max_score, min_score）
+        for s in students_idx:
+            prob += student_scores[s] <= max_score, f"MaxScore_s{s}"
+            prob += student_scores[s] >= min_score, f"MinScore_s{s}"
+
+        print(f"変数数: {len(prob.variables())}")
+        print(f"制約数: {len(prob.constraints)}")
+        print("\n最適化を実行中（しばらくお待ちください）...")
+
+        # 求解
+        start_time = time.time()
+        prob.solve()
+        solve_time = time.time() - start_time
+
+        print(f"\n✓ 求解完了（{solve_time:.1f}秒）")
+        print(f"ステータス: {LpStatus[prob.status]}")
+
+        if prob.status != 1:  # 1 = Optimal
+            print("警告: 最適解が見つかりませんでした。制約を緩和して再試行します...")
+            return self.solve_with_relaxed_constraints()
+
+        # 結果の抽出
         course_selection = {student['id']: set() for student in self.students}
-
-        # 各講座の受講者数カウント
-        course_counts = {course: 0 for course in self.courses}
-        target_per_course = len(self.students) * self.num_periods / len(self.courses)
-        max_per_course = target_per_course + self.tolerance * len(self.students) / 10
-
-        print(f"\n【講座選択フェーズ】")
-        print(f"目標受講者数: 各講座 約{target_per_course:.1f}名")
-
-        # 各生徒が num_periods 個の講座を選択
-        for round_num in range(self.num_periods):
-            # 各ラウンドで生徒をシャッフル
-            students_shuffled = self.students.copy()
-            random.shuffle(students_shuffled)
-
-            for student in students_shuffled:
-                best_course = None
-                best_rank = 999
-
-                # まだ選択していない講座から、希望順位が高いものを選ぶ
-                for course in student['preferences']:
-                    if course in course_selection[student['id']]:
-                        continue  # 既に選択済み
-                    if course_counts[course] >= max_per_course:
-                        continue  # 定員オーバー
-                    rank = self.get_preference_rank(student, course)
-                    if rank < best_rank:
-                        best_rank = rank
-                        best_course = course
-
-                # 希望にない講座も検討（人数が少ない講座）
-                if best_course is None:
-                    available = [c for c in self.courses
-                                 if c not in course_selection[student['id']]]
-                    if available:
-                        best_course = min(available, key=lambda c: course_counts[c])
-
-                if best_course:
-                    course_selection[student['id']].add(best_course)
-                    course_counts[best_course] += 1
-
-        # ========== フェーズ2: 時間割作成 ==========
-        # schedule[student_id][period] = course
         schedule = {student['id']: {} for student in self.students}
 
-        print(f"\n【時間割作成フェーズ】")
+        for s in students_idx:
+            student_id = self.students[s]['id']
+            for c in courses_idx:
+                for p in periods_idx:
+                    if value(x[s, c, p]) and value(x[s, c, p]) > 0.5:
+                        course_name = self.courses[c]
+                        course_selection[student_id].add(course_name)
+                        schedule[student_id][p] = course_name
 
-        for period in range(1, self.num_periods + 1):
-            # この時限の各講座の人数
-            period_course_counts = {course: 0 for course in self.courses}
-
-            # 生徒をシャッフル
-            students_shuffled = self.students.copy()
-            random.shuffle(students_shuffled)
-
-            for student in students_shuffled:
-                # この生徒が選択した講座のうち、まだ配置されていないもの
-                selected = course_selection[student['id']]
-                already_scheduled = set(schedule[student['id']].values())
-                available = selected - already_scheduled
-
-                if not available:
-                    continue
-
-                # 人数が少ない講座を優先
-                best_course = min(available, key=lambda c: period_course_counts[c])
-
-                schedule[student['id']][period] = best_course
-                period_course_counts[best_course] += 1
+        # 目的関数の値
+        print(f"目的関数値: {value(prob.objective):.2f}")
 
         return course_selection, schedule
 
-    def improve_assignment(self, course_selection, schedule, iterations=30000):
-        """焼きなまし法で配置を改善"""
-        best_selection = copy.deepcopy(course_selection)
-        best_schedule = copy.deepcopy(schedule)
-        best_score = self.calculate_fairness_score(best_selection, best_schedule)
+    def solve_with_relaxed_constraints(self):
+        """制約を緩和して解を求める（フォールバック）"""
+        print("\n制約を緩和して再試行...")
 
-        current_selection = copy.deepcopy(course_selection)
-        current_schedule = copy.deepcopy(schedule)
-        current_score = best_score
+        prob = LpProblem("StudentScheduler_Relaxed", LpMinimize)
 
-        temperature = 200.0
-        cooling_rate = 0.9997
+        students_idx = range(len(self.students))
+        courses_idx = range(len(self.courses))
+        periods_idx = range(1, self.num_periods + 1)
 
-        print(f"\n配置を最適化中（初期スコア: {best_score:.1f}）", end="")
+        x = {}
+        for s in students_idx:
+            for c in courses_idx:
+                for p in periods_idx:
+                    x[s, c, p] = LpVariable(f"x_{s}_{c}_{p}", cat=LpBinary)
 
-        for iteration in range(iterations):
-            if iteration % 3000 == 0:
-                print(".", end="", flush=True)
+        # 目的関数（公平性ペナルティなし）
+        prob += lpSum(
+            self.get_preference_rank(self.students[s], self.courses[c]) * x[s, c, p]
+            for s in students_idx
+            for c in courses_idx
+            for p in periods_idx
+        ), "Total_Preference"
 
-            # 操作を選択
-            operation = random.choice(['swap_schedule', 'swap_course'])
+        # 制約1: 各生徒は各時限で1つの講座
+        for s in students_idx:
+            for p in periods_idx:
+                prob += lpSum(x[s, c, p] for c in courses_idx) == 1
 
-            if operation == 'swap_schedule':
-                # 同じ時限で2人の生徒の講座を交換
-                period = random.randint(1, self.num_periods)
-                students_in_period = [s for s in self.students
-                                      if period in current_schedule[s['id']]]
-                if len(students_in_period) < 2:
-                    continue
+        # 制約2: 各生徒は各講座を最大1回
+        for s in students_idx:
+            for c in courses_idx:
+                prob += lpSum(x[s, c, p] for p in periods_idx) <= 1
 
-                s1, s2 = random.sample(students_in_period, 2)
-                c1 = current_schedule[s1['id']][period]
-                c2 = current_schedule[s2['id']][period]
+        # 制約3: 人数バランス（緩和）
+        target = len(self.students) / len(self.courses)
+        for p in periods_idx:
+            for c in courses_idx:
+                count = lpSum(x[s, c, p] for s in students_idx)
+                prob += count >= max(0, int(target - self.tolerance * 2))
+                prob += count <= int(target + self.tolerance * 2) + 1
 
-                if c1 == c2:
-                    continue
+        prob.solve()
 
-                # 交換が有効か確認（お互いがその講座を選択しているか）
-                if c2 not in current_selection[s1['id']]:
-                    continue
-                if c1 not in current_selection[s2['id']]:
-                    continue
+        if prob.status != 1:
+            raise ValueError("最適化に失敗しました。入力データを確認してください。")
 
-                # 交換後に重複がないか確認
-                s1_others = set(current_schedule[s1['id']].values()) - {c1}
-                s2_others = set(current_schedule[s2['id']].values()) - {c2}
-                if c2 in s1_others or c1 in s2_others:
-                    continue
+        course_selection = {student['id']: set() for student in self.students}
+        schedule = {student['id']: {} for student in self.students}
 
-                # 交換を試行
-                new_schedule = copy.deepcopy(current_schedule)
-                new_schedule[s1['id']][period] = c2
-                new_schedule[s2['id']][period] = c1
+        for s in students_idx:
+            student_id = self.students[s]['id']
+            for c in courses_idx:
+                for p in periods_idx:
+                    if value(x[s, c, p]) and value(x[s, c, p]) > 0.5:
+                        course_name = self.courses[c]
+                        course_selection[student_id].add(course_name)
+                        schedule[student_id][p] = course_name
 
-                new_score = self.calculate_fairness_score(current_selection, new_schedule)
-
-            else:  # swap_course
-                # 2人の生徒の選択講座を1つずつ交換
-                s1, s2 = random.sample(self.students, 2)
-
-                # s1だけが持っている講座とs2だけが持っている講座を交換
-                s1_only = current_selection[s1['id']] - current_selection[s2['id']]
-                s2_only = current_selection[s2['id']] - current_selection[s1['id']]
-
-                if not s1_only or not s2_only:
-                    continue
-
-                c1 = random.choice(list(s1_only))
-                c2 = random.choice(list(s2_only))
-
-                # 新しい選択を作成
-                new_selection = copy.deepcopy(current_selection)
-                new_selection[s1['id']] = (current_selection[s1['id']] - {c1}) | {c2}
-                new_selection[s2['id']] = (current_selection[s2['id']] - {c2}) | {c1}
-
-                # スケジュールも更新
-                new_schedule = copy.deepcopy(current_schedule)
-
-                # s1のスケジュールでc1をc2に置換
-                for period, course in list(new_schedule[s1['id']].items()):
-                    if course == c1:
-                        new_schedule[s1['id']][period] = c2
-
-                # s2のスケジュールでc2をc1に置換
-                for period, course in list(new_schedule[s2['id']].items()):
-                    if course == c2:
-                        new_schedule[s2['id']][period] = c1
-
-                new_score = self.calculate_fairness_score(new_selection, new_schedule)
-                current_selection = new_selection
-
-            # スコア改善または確率的に受け入れ
-            delta = new_score - current_score
-            if delta < 0 or random.random() < pow(2.718, -delta / temperature):
-                if operation == 'swap_schedule':
-                    current_schedule = new_schedule
-                else:
-                    current_selection = new_selection
-                    current_schedule = new_schedule
-                current_score = new_score
-
-                if current_score < best_score:
-                    best_selection = copy.deepcopy(current_selection)
-                    best_schedule = copy.deepcopy(current_schedule)
-                    best_score = current_score
-
-            temperature *= cooling_rate
-
-        print(f" 完了！（最終スコア: {best_score:.1f}）")
-        return best_selection, best_schedule
+        return course_selection, schedule
 
     def save_results(self, course_selection, schedule):
         """結果をExcelファイルに保存"""
@@ -499,7 +448,6 @@ class StudentScheduler:
         ws_result = wb.active
         ws_result.title = "生徒別配置結果"
 
-        # ヘッダー
         headers = ['生徒番号', '氏名'] + [f'{i}限' for i in range(1, self.num_periods + 1)]
         for col, header in enumerate(headers, 1):
             cell = ws_result.cell(1, col, header)
@@ -508,37 +456,31 @@ class StudentScheduler:
             cell.border = border
             cell.alignment = center_align
 
-        # 生徒データ（生徒番号順にソート）
         sorted_students = sorted(self.students, key=lambda s: s['id'])
 
         for row_idx, student in enumerate(sorted_students, 2):
-            # 生徒番号
             cell = ws_result.cell(row_idx, 1, student['id'])
             cell.border = border
             cell.alignment = center_align
 
-            # 氏名
             cell = ws_result.cell(row_idx, 2, student['name'])
             cell.border = border
             cell.alignment = left_align
 
-            # 各時限の配置
             for period in range(1, self.num_periods + 1):
                 course = schedule[student['id']].get(period, '')
                 cell = ws_result.cell(row_idx, 2 + period, course)
                 cell.border = border
                 cell.alignment = left_align
 
-                # 希望順位に応じて色分け
                 rank = self.get_preference_rank(student, course)
                 if rank <= 2:
                     cell.fill = good_fill
                 elif rank <= 4:
                     cell.fill = warning_fill
-                elif rank < 999:
+                elif rank <= self.num_choices:
                     cell.fill = bad_fill
 
-        # 列幅調整
         ws_result.column_dimensions['A'].width = 12
         ws_result.column_dimensions['B'].width = 15
         for col in range(3, 3 + self.num_periods):
@@ -550,7 +492,6 @@ class StudentScheduler:
         col_offset = 0
         for period in range(1, self.num_periods + 1):
             for course in self.courses:
-                # 講座ヘッダー
                 start_col = col_offset + 1
                 cell = ws_roster.cell(1, start_col, f"【{period}限】{course}")
                 cell.font = Font(bold=True, size=11, color='FFFFFF')
@@ -561,7 +502,6 @@ class StudentScheduler:
                                        end_row=1, end_column=start_col + 1)
                 ws_roster.cell(1, start_col + 1).border = border
 
-                # サブヘッダー
                 ws_roster.cell(2, start_col, '生徒番号').fill = subheader_fill
                 ws_roster.cell(2, start_col, '生徒番号').border = border
                 ws_roster.cell(2, start_col, '生徒番号').alignment = center_align
@@ -569,12 +509,8 @@ class StudentScheduler:
                 ws_roster.cell(2, start_col + 1, '氏名').border = border
                 ws_roster.cell(2, start_col + 1, '氏名').alignment = center_align
 
-                # この講座の生徒を生徒番号順でリスト
-                course_students = []
-                for student in self.students:
-                    if schedule[student['id']].get(period) == course:
-                        course_students.append(student)
-
+                course_students = [s for s in self.students
+                                   if schedule[s['id']].get(period) == course]
                 course_students.sort(key=lambda s: s['id'])
 
                 for row_idx, student in enumerate(course_students, 3):
@@ -583,23 +519,20 @@ class StudentScheduler:
                     ws_roster.cell(row_idx, start_col + 1, student['name']).border = border
                     ws_roster.cell(row_idx, start_col + 1).alignment = left_align
 
-                # 人数表示
                 count_row = max(len(course_students) + 3, 4)
                 ws_roster.cell(count_row, start_col, f"計: {len(course_students)}名")
                 ws_roster.cell(count_row, start_col).font = Font(bold=True)
 
-                # 列幅調整
                 ws_roster.column_dimensions[get_column_letter(start_col)].width = 10
                 ws_roster.column_dimensions[get_column_letter(start_col + 1)].width = 12
 
-                col_offset += 3  # 次の講座へ（1列空ける）
+                col_offset += 3
 
-            col_offset += 1  # 次の時限へ（さらに1列空ける）
+            col_offset += 1
 
         # ========== シート3: 希望達成度 ==========
         ws_stats = wb.create_sheet("希望達成度")
 
-        # ヘッダー
         stat_headers = ['生徒番号', '氏名', '満足度', '平均順位'] + \
                        [f'第{i}希望' for i in range(1, self.num_choices + 1)] + ['希望外']
         for col, header in enumerate(stat_headers, 1):
@@ -609,7 +542,6 @@ class StudentScheduler:
             cell.border = border
             cell.alignment = center_align
 
-        # 各生徒の統計を計算
         student_stats = []
         for student in sorted_students:
             rank_counts = defaultdict(int)
@@ -619,7 +551,7 @@ class StudentScheduler:
             selected = course_selection.get(student['id'], set())
             for course in selected:
                 rank = self.get_preference_rank(student, course)
-                if rank < 999:
+                if rank <= self.num_choices:
                     rank_counts[rank] += 1
                     total_rank += rank
                 else:
@@ -628,9 +560,8 @@ class StudentScheduler:
                 count += 1
 
             avg_rank = total_rank / count if count > 0 else 0
-            # 満足度スコア: 100点満点
-            max_possible = self.num_periods  # 全部第1希望
-            min_possible = self.num_periods * (self.num_choices + 1)  # 全部希望外
+            max_possible = self.num_periods
+            min_possible = self.num_periods * (self.num_choices + 1)
             satisfaction = 100 * (min_possible - total_rank) / (min_possible - max_possible) if min_possible > max_possible else 100
 
             student_stats.append({
@@ -640,7 +571,6 @@ class StudentScheduler:
                 'rank_counts': rank_counts
             })
 
-        # 満足度でソート（低い順）
         student_stats.sort(key=lambda x: x['satisfaction'])
 
         for row_idx, stat in enumerate(student_stats, 2):
@@ -677,7 +607,6 @@ class StudentScheduler:
             cell.border = border
             cell.alignment = center_align
 
-        # 統計サマリー
         summary_row = len(student_stats) + 3
         ws_stats.cell(summary_row, 1, '【統計】').font = Font(bold=True)
 
@@ -692,11 +621,10 @@ class StudentScheduler:
             (summary_row + 5, '平均希望順位', f"{sum(avg_ranks)/len(avg_ranks):.2f}"),
         ]
 
-        for row, label, value in stats_info:
+        for row, label, val in stats_info:
             ws_stats.cell(row, 1, label).font = Font(bold=True)
-            ws_stats.cell(row, 2, value)
+            ws_stats.cell(row, 2, val)
 
-        # 列幅調整
         ws_stats.column_dimensions['A'].width = 12
         ws_stats.column_dimensions['B'].width = 15
         ws_stats.column_dimensions['C'].width = 12
@@ -713,7 +641,6 @@ class StudentScheduler:
         print("配置結果サマリー")
         print("=" * 70)
 
-        # 時限・講座別人数
         print("\n【時限・講座別人数】")
         target = len(self.students) / len(self.courses)
         for period in range(1, self.num_periods + 1):
@@ -726,7 +653,6 @@ class StudentScheduler:
                 status = "✓" if abs(diff) <= self.tolerance else "!"
                 print(f"    {course}: {count}名 ({diff_str}) {status}")
 
-        # 希望達成状況
         print("\n【希望達成状況】")
         rank_counts = defaultdict(int)
         total_assignments = 0
@@ -736,7 +662,7 @@ class StudentScheduler:
             for course in selected:
                 total_assignments += 1
                 rank = self.get_preference_rank(student, course)
-                if rank < 999:
+                if rank <= self.num_choices:
                     rank_counts[rank] += 1
                 else:
                     rank_counts['希望外'] += 1
@@ -756,11 +682,10 @@ class StudentScheduler:
 
 def main():
     print("=" * 70)
-    print("        学生講座配置プログラム")
+    print("        学生講座配置プログラム（ILP最適化版）")
     print("=" * 70)
     print()
 
-    # 入力
     while True:
         try:
             num_students = int(input("生徒の人数を入力してください: "))
@@ -800,46 +725,34 @@ def main():
     try:
         scheduler = StudentScheduler(num_students, num_periods, num_choices, tolerance)
 
-        # テンプレート作成
         print("\n" + "=" * 70)
         print("ステップ1: 入力ファイルの準備")
         print("=" * 70)
         scheduler.create_input_template()
 
-        # Excelファイルを開いて待機
         print("\n" + "=" * 70)
         print("ステップ2: データ入力")
         print("=" * 70)
         scheduler.open_excel_file(scheduler.input_file)
         scheduler.wait_for_file_close(scheduler.input_file)
 
-        # データ読み込み
         print("\n" + "=" * 70)
         print("ステップ3: データ処理")
         print("=" * 70)
         scheduler.load_data()
 
-        # 初期配置
         print("\n" + "=" * 70)
-        print("ステップ4: 配置計算")
+        print("ステップ4: 最適化計算（ILP）")
         print("=" * 70)
-        course_selection, schedule = scheduler.greedy_assign()
+        course_selection, schedule = scheduler.solve_with_ilp()
 
-        # 配置の改善
-        course_selection, schedule = scheduler.improve_assignment(
-            course_selection, schedule, iterations=30000
-        )
-
-        # 結果の表示
         scheduler.print_summary(course_selection, schedule)
 
-        # 結果を保存
         print("\n" + "=" * 70)
         print("ステップ5: 結果の保存")
         print("=" * 70)
         scheduler.save_results(course_selection, schedule)
 
-        # 結果ファイルを開く
         print("\n結果ファイルを開きます...")
         scheduler.open_excel_file(scheduler.output_file)
 
