@@ -15,11 +15,12 @@ from pulp import (
 
 
 class StudentScheduler:
-    def __init__(self, num_students, num_periods, num_choices, tolerance):
+    def __init__(self, num_students, num_periods, num_choices, min_per_course, max_per_course):
         self.num_students = num_students
         self.num_periods = num_periods  # 受講する講座数（例: 4）
         self.num_choices = num_choices  # 希望順位の数（例: 6、これが講座数）
-        self.tolerance = tolerance
+        self.min_per_course = min_per_course
+        self.max_per_course = max_per_course
         self.students = []
         self.courses = []  # 全講座リスト
         self.input_file = "入力_生徒希望アンケート.xlsx"
@@ -106,7 +107,7 @@ class StudentScheduler:
             f"・講座数: {self.num_choices}講座（全講座が開講されます）",
             f"・受講数: 各生徒は{self.num_periods}講座を受講",
             f"・時限数: {self.num_periods}時限",
-            f"・人数許容範囲: 目標 ±{self.tolerance}名",
+            f"・人数範囲: {self.min_per_course}〜{self.max_per_course}名/講座/時限",
             "",
             "■ 配置ルール",
             f"・各時限で全{self.num_choices}講座が開講されます",
@@ -316,15 +317,11 @@ class StudentScheduler:
                 prob += y[s, c] == lpSum(x[s, c, p] for p in periods_idx), f"Link_y_x_s{s}_c{c}"
 
         # 制約4: 各時限の各講座の人数バランス
-        target_per_course = len(self.students) / len(self.courses)
-        min_per_course = max(0, int(target_per_course - self.tolerance))
-        max_per_course = int(target_per_course + self.tolerance) + 1
-
         for p in periods_idx:
             for c in courses_idx:
                 count = lpSum(x[s, c, p] for s in students_idx)
-                prob += count >= min_per_course, f"MinBalance_p{p}_c{c}"
-                prob += count <= max_per_course, f"MaxBalance_p{p}_c{c}"
+                prob += count >= self.min_per_course, f"MinBalance_p{p}_c{c}"
+                prob += count <= self.max_per_course, f"MaxBalance_p{p}_c{c}"
 
         # 制約5: 公平性（max_score, min_score）
         for s in students_idx:
@@ -400,12 +397,13 @@ class StudentScheduler:
                 prob += lpSum(x[s, c, p] for p in periods_idx) <= 1
 
         # 制約3: 人数バランス（緩和）
-        target = len(self.students) / len(self.courses)
+        relaxed_min = max(0, self.min_per_course - 5)
+        relaxed_max = self.max_per_course + 5
         for p in periods_idx:
             for c in courses_idx:
                 count = lpSum(x[s, c, p] for s in students_idx)
-                prob += count >= max(0, int(target - self.tolerance * 2))
-                prob += count <= int(target + self.tolerance * 2) + 1
+                prob += count >= relaxed_min
+                prob += count <= relaxed_max
 
         prob.solve()
 
@@ -642,16 +640,14 @@ class StudentScheduler:
         print("=" * 70)
 
         print("\n【時限・講座別人数】")
-        target = len(self.students) / len(self.courses)
         for period in range(1, self.num_periods + 1):
             print(f"\n  {period}限:")
             for course in self.courses:
                 count = sum(1 for s in self.students
                             if schedule[s['id']].get(period) == course)
-                diff = count - target
-                diff_str = f"+{diff:.0f}" if diff > 0 else f"{diff:.0f}"
-                status = "✓" if abs(diff) <= self.tolerance else "!"
-                print(f"    {course}: {count}名 ({diff_str}) {status}")
+                in_range = self.min_per_course <= count <= self.max_per_course
+                status = "✓" if in_range else "!"
+                print(f"    {course}: {count}名 {status}")
 
         print("\n【希望達成状況】")
         rank_counts = defaultdict(int)
@@ -713,17 +709,30 @@ def main():
         except ValueError:
             print("数値を入力してください。")
 
+    # 平均人数を計算して表示
+    avg_per_course = num_students / num_choices
+    print(f"\n※ 1コマあたりの平均人数: {avg_per_course:.1f}名")
+
     while True:
         try:
-            tolerance = int(input("人数の許容範囲を入力してください（例: ±2なら 2）: "))
-            if tolerance >= 0:
+            min_per_course = int(input("1コマあたりの最低人数を入力してください: "))
+            if min_per_course >= 0:
                 break
             print("0以上の数値を入力してください。")
         except ValueError:
             print("数値を入力してください。")
 
+    while True:
+        try:
+            max_per_course = int(input("1コマあたりの最高人数を入力してください: "))
+            if max_per_course >= min_per_course:
+                break
+            print(f"{min_per_course}以上の数値を入力してください。")
+        except ValueError:
+            print("数値を入力してください。")
+
     try:
-        scheduler = StudentScheduler(num_students, num_periods, num_choices, tolerance)
+        scheduler = StudentScheduler(num_students, num_periods, num_choices, min_per_course, max_per_course)
 
         print("\n" + "=" * 70)
         print("ステップ1: 入力ファイルの準備")
