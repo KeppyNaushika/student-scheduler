@@ -281,6 +281,9 @@ class StudentScheduler:
         # assignment[student_id][period] = course
         assignment = {student['id']: {} for student in self.students}
 
+        # 各生徒が既に配置された講座を追跡
+        student_assigned_courses = {student['id']: set() for student in self.students}
+
         target_per_course = len(self.students) // len(self.courses)
         max_per_course = target_per_course + self.tolerance
         min_per_course = max(0, target_per_course - self.tolerance)
@@ -291,18 +294,19 @@ class StudentScheduler:
             # この時限の各講座の現在の人数
             course_counts = {course: 0 for course in self.courses}
 
-            # 生徒を希望順位でソート（第1希望が人気薄い生徒を先に）
-            students_sorted = sorted(
-                self.students,
-                key=lambda s: -self.get_preference_rank(s, self.courses[0])
-            )
+            # 生徒をランダムな順番で処理（毎時限で順番を変える）
+            students_shuffled = self.students.copy()
+            random.shuffle(students_shuffled)
 
-            for student in students_sorted:
+            for student in students_shuffled:
                 best_course = None
                 best_rank = 999
 
-                # 希望順位が高く、まだ定員に余裕がある講座を探す
+                # 希望順位が高く、まだ定員に余裕があり、まだ受けていない講座を探す
                 for course in self.courses:
+                    # 既に受けた講座はスキップ
+                    if course in student_assigned_courses[student['id']]:
+                        continue
                     if course_counts[course] >= max_per_course:
                         continue
                     rank = self.get_preference_rank(student, course)
@@ -310,30 +314,40 @@ class StudentScheduler:
                         best_rank = rank
                         best_course = course
 
-                # 全講座が満員の場合、最も人数が少ない講座に
+                # 適切な講座が見つからない場合、まだ受けていない中で最も人数が少ない講座に
                 if best_course is None:
-                    best_course = min(course_counts, key=course_counts.get)
+                    available_courses = [c for c in self.courses
+                                         if c not in student_assigned_courses[student['id']]]
+                    if available_courses:
+                        best_course = min(available_courses, key=lambda c: course_counts[c])
+                    else:
+                        # 全講座受講済み（時限数 > 講座数の場合）- 最も人数が少ない講座に
+                        best_course = min(course_counts, key=course_counts.get)
 
                 assignment[student['id']][period] = best_course
                 course_counts[best_course] += 1
+                student_assigned_courses[student['id']].add(best_course)
 
         return assignment
 
-    def improve_assignment(self, assignment, iterations=10000):
+    def get_student_courses(self, assignment, student_id):
+        """生徒が受講している全講座のセットを取得"""
+        return set(assignment[student_id].values())
+
+    def improve_assignment(self, assignment, iterations=20000):
         """焼きなまし法で配置を改善"""
         best_assignment = copy.deepcopy(assignment)
         best_score = self.calculate_assignment_score(best_assignment)
         current_assignment = copy.deepcopy(assignment)
         current_score = best_score
 
-        target_per_course = len(self.students) // len(self.courses)
         temperature = 100.0
-        cooling_rate = 0.9995
+        cooling_rate = 0.9997
 
         print(f"\n配置を最適化中（初期スコア: {best_score}）", end="")
 
         for iteration in range(iterations):
-            if iteration % 1000 == 0:
+            if iteration % 2000 == 0:
                 print(".", end="", flush=True)
 
             # ランダムに時限と2人の生徒を選ぶ
@@ -346,11 +360,17 @@ class StudentScheduler:
             if c1 == c2:
                 continue
 
-            # 交換後の人数チェック
-            count_c1 = self.count_course_students(current_assignment, period, c1)
-            count_c2 = self.count_course_students(current_assignment, period, c2)
+            # 交換後に同じ講座を複数回受講することにならないかチェック
+            s1_courses = self.get_student_courses(current_assignment, s1['id'])
+            s2_courses = self.get_student_courses(current_assignment, s2['id'])
 
-            # 交換しても人数バランスは変わらない（1対1交換なので）
+            # s1がc2を受けることになる: s1が既に他の時限でc2を受けていたらNG
+            # s2がc1を受けることになる: s2が既に他の時限でc1を受けていたらNG
+            s1_other_courses = s1_courses - {c1}  # 現在の時限以外で受けている講座
+            s2_other_courses = s2_courses - {c2}
+
+            if c2 in s1_other_courses or c1 in s2_other_courses:
+                continue  # 交換すると重複するのでスキップ
 
             # 交換を試行
             new_assignment = copy.deepcopy(current_assignment)
